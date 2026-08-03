@@ -225,13 +225,13 @@ enum OutOfMemoryMode {
 
 /// Maximum estimated aggregate and group-key state represented by one emitted chunk.
 ///
-/// Eight MiB keeps a dense 16 KiB HLL state to roughly 512 groups per aggregate
+/// Two MiB keeps a dense 16 KiB HLL state to roughly 128 groups per aggregate
 /// expression, rather than allowing the default 8192-row batch to materialize about
-/// 128 MiB per expression. It also leaves headroom for Arrow output buffers and spill
-/// sorting in constrained memory pools, while compact aggregate states still emit at
+/// 128 MiB per expression. Spill sorting can require twice the emitted buffer size, so
+/// this also leaves headroom in constrained shared pools while compact states emit at
 /// the configured batch size. This is an estimation target rather than a reservation;
 /// a single larger group is still emitted alone and normal reservation errors apply.
-const EMIT_STATE_TARGET_BYTES: usize = 8 * 1024 * 1024;
+const EMIT_STATE_TARGET_BYTES: usize = 2 * 1024 * 1024;
 
 fn bounded_emit_group_count(
     num_groups: usize,
@@ -1705,11 +1705,11 @@ mod tests {
 
         assert_eq!(
             bounded_emit_group_count(num_groups, num_groups, single_hll_bytes),
-            512
+            128
         );
         assert_eq!(
             bounded_emit_group_count(num_groups, num_groups, two_hll_bytes),
-            256
+            64
         );
         assert_eq!(
             bounded_emit_group_count(num_groups, num_groups, num_groups),
