@@ -18,7 +18,7 @@
 //! Defines physical expressions that can evaluated at runtime during query execution
 
 use crate::hyperloglog::{HLL_HASH_STATE, HyperLogLog};
-use arrow::array::{Array, BinaryArray, StringViewArray};
+use arrow::array::{Array, FixedSizeBinaryArray, StringViewArray};
 use arrow::array::{
     GenericBinaryArray, GenericStringArray, OffsetSizeTrait, PrimitiveArray,
 };
@@ -49,6 +49,8 @@ use std::fmt::{Debug, Formatter};
 use std::hash::{BuildHasher, Hash};
 use std::marker::PhantomData;
 
+const HLL_STATE_SIZE: i32 = 16384;
+
 make_udaf_expr_and_func!(
     ApproxDistinct,
     approx_distinct,
@@ -60,15 +62,18 @@ make_udaf_expr_and_func!(
 impl<T: Hash + ?Sized> From<&HyperLogLog<T>> for ScalarValue {
     fn from(v: &HyperLogLog<T>) -> ScalarValue {
         let values = v.as_ref().to_vec();
-        ScalarValue::Binary(Some(values))
+        ScalarValue::FixedSizeBinary(HLL_STATE_SIZE, Some(values))
     }
 }
 
 impl<T: Hash + ?Sized> TryFrom<&[u8]> for HyperLogLog<T> {
     type Error = DataFusionError;
     fn try_from(v: &[u8]) -> Result<HyperLogLog<T>> {
-        let arr: [u8; 16384] = v.try_into().map_err(|_| {
-            internal_datafusion_err!("Impossibly got invalid binary array from states")
+        let arr: [u8; HLL_STATE_SIZE as usize] = v.try_into().map_err(|_| {
+            internal_datafusion_err!(
+                "approx_distinct HLL state has length {}, expected {HLL_STATE_SIZE}",
+                v.len()
+            )
         })?;
         Ok(HyperLogLog::<T>::new_with_registers(arr))
     }
@@ -77,12 +82,18 @@ impl<T: Hash + ?Sized> TryFrom<&[u8]> for HyperLogLog<T> {
 impl<T: Hash + ?Sized> TryFrom<&ScalarValue> for HyperLogLog<T> {
     type Error = DataFusionError;
     fn try_from(v: &ScalarValue) -> Result<HyperLogLog<T>> {
-        if let ScalarValue::Binary(Some(slice)) = v {
-            slice.as_slice().try_into()
-        } else {
-            internal_err!(
-                "Impossibly got invalid scalar value while converting to HyperLogLog"
-            )
+        match v {
+            ScalarValue::FixedSizeBinary(width, Some(value))
+                if *width == HLL_STATE_SIZE =>
+            {
+                value.as_slice().try_into()
+            }
+            ScalarValue::FixedSizeBinary(width, _) => internal_err!(
+                "approx_distinct HLL state has width {width}, expected {HLL_STATE_SIZE}"
+            ),
+            _ => internal_err!(
+                "approx_distinct HLL state must be FixedSizeBinary({HLL_STATE_SIZE})"
+            ),
         }
     }
 }
@@ -196,12 +207,31 @@ where
 macro_rules! default_accumulator_impl {
     () => {
         fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
-            assert_eq!(1, states.len(), "expect only 1 element in the states");
-            let binary_array = downcast_value!(states[0], BinaryArray);
+            if states.len() != 1 {
+                return internal_err!(
+                    "approx_distinct expects one HLL state array, got {}",
+                    states.len()
+                );
+            }
+            let binary_array = states[0]
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .ok_or_else(|| {
+                    internal_datafusion_err!(
+                        "approx_distinct HLL state must be FixedSizeBinary({HLL_STATE_SIZE}), got {}",
+                        states[0].data_type()
+                    )
+                })?;
+            if binary_array.value_length() != HLL_STATE_SIZE {
+                return internal_err!(
+                    "approx_distinct HLL state has width {}, expected {HLL_STATE_SIZE}",
+                    binary_array.value_length()
+                );
+            }
             for v in binary_array.iter() {
                 let v = v.ok_or_else(|| {
                     internal_datafusion_err!(
-                        "Impossibly got empty binary array from states"
+                        "approx_distinct HLL state must not be null"
                     )
                 })?;
                 let other = v.try_into()?;
@@ -411,7 +441,7 @@ impl AggregateUDFImpl for ApproxDistinct {
             _ => Ok(vec![
                 Field::new(
                     format_state_name(args.name, "hll_registers"),
-                    DataType::Binary,
+                    DataType::FixedSizeBinary(HLL_STATE_SIZE),
                     false,
                 )
                 .into(),
@@ -481,7 +511,7 @@ impl AggregateUDFImpl for ApproxDistinct {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::AsArray;
+    use arrow::array::{AsArray, Int64Array};
     use std::sync::Arc;
 
     // A string longer than the 12-byte inline limit
@@ -492,6 +522,82 @@ mod tests {
             ScalarValue::UInt64(Some(v)) => v,
             other => panic!("unexpected evaluate result: {other:?}"),
         }
+    }
+
+    fn state_fields(input_type: DataType) -> Vec<FieldRef> {
+        let input_fields = vec![Arc::new(Field::new("input", input_type, true))];
+        ApproxDistinct::new()
+            .state_fields(StateFieldsArgs {
+                name: "approx_distinct",
+                input_fields: &input_fields,
+                return_field: Arc::new(Field::new("result", DataType::UInt64, false)),
+                ordering_fields: &[],
+                is_distinct: false,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn hll_state_schema_is_fixed_size_binary() {
+        let fields = state_fields(DataType::Int64);
+        assert_eq!(
+            fields[0].data_type(),
+            &DataType::FixedSizeBinary(HLL_STATE_SIZE)
+        );
+        assert!(!fields[0].is_nullable());
+
+        let fields = state_fields(DataType::Int16);
+        assert!(matches!(fields[0].data_type(), DataType::List(_)));
+    }
+
+    #[test]
+    fn hll_state_round_trip() {
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 2, 3]));
+        let mut source = NumericHLLAccumulator::<Int64Type>::new();
+        source.update_batch(&[values]).unwrap();
+        let expected = source.evaluate().unwrap();
+        let state = source.state().unwrap();
+        assert!(matches!(
+            &state[0],
+            ScalarValue::FixedSizeBinary(HLL_STATE_SIZE, Some(value))
+                if value.len() == HLL_STATE_SIZE as usize
+        ));
+
+        let state_array = ScalarValue::iter_to_array(state).unwrap();
+        let mut merged = NumericHLLAccumulator::<Int64Type>::new();
+        merged.merge_batch(&[state_array]).unwrap();
+        assert_eq!(merged.evaluate().unwrap(), expected);
+    }
+
+    #[test]
+    fn malformed_hll_state_is_rejected() {
+        let malformed = ScalarValue::FixedSizeBinary(
+            HLL_STATE_SIZE,
+            Some(vec![0; HLL_STATE_SIZE as usize - 1]),
+        );
+        let error = HyperLogLog::<i64>::try_from(&malformed).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("has length 16383, expected 16384")
+        );
+
+        let wrong_width = ScalarValue::FixedSizeBinary(8, Some(vec![0; 8]));
+        let error = HyperLogLog::<i64>::try_from(&wrong_width).unwrap_err();
+        assert!(error.to_string().contains("has width 8, expected 16384"));
+
+        let wrong_width_array = ScalarValue::iter_to_array(vec![wrong_width]).unwrap();
+        let mut acc = NumericHLLAccumulator::<Int64Type>::new();
+        let error = acc.merge_batch(&[wrong_width_array]).unwrap_err();
+        assert!(error.to_string().contains("has width 8, expected 16384"));
+
+        let null_state = ScalarValue::iter_to_array(vec![ScalarValue::FixedSizeBinary(
+            HLL_STATE_SIZE,
+            None,
+        )])
+        .unwrap();
+        let error = acc.merge_batch(&[null_state]).unwrap_err();
+        assert!(error.to_string().contains("must not be null"));
     }
 
     /// Regression: a short (≤ 12-byte) Utf8View string must hash identically
