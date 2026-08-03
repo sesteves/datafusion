@@ -1,0 +1,19 @@
+datafusion/functions-aggregate/src/approx_distinct.rs
+  s_7b3ae3840ef689::t_9525c2414a8208 21,52-53,65,72-76,85-96,210-230,234,444,514,527-602
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "5ab4a4445af5227d7d46545fa04041e21ef958fb",
+  "prompts": {},
+  "sessions": {
+    "s_7b3ae3840ef689": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_036358d68ffewS6cwcW9NdDVYp",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Sergio Esteves <sesteves@cloudflare.com>"
+    }
+  }
+}
