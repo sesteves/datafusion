@@ -50,6 +50,9 @@ use std::hash::{BuildHasher, Hash};
 use std::marker::PhantomData;
 
 /// Number of registers in the dense HyperLogLog intermediate state.
+///
+/// Arrow represents `FixedSizeBinary` widths as `i32`; callers use `usize` only
+/// when allocating or validating the register buffer.
 pub const APPROX_DISTINCT_HLL_STATE_SIZE: i32 = 16384;
 
 make_udaf_expr_and_func!(
@@ -572,11 +575,8 @@ mod tests {
 
     #[test]
     fn malformed_hll_state_is_rejected() {
-        let malformed = ScalarValue::FixedSizeBinary(
-            APPROX_DISTINCT_HLL_STATE_SIZE,
-            Some(vec![0; APPROX_DISTINCT_HLL_STATE_SIZE as usize - 1]),
-        );
-        let error = HyperLogLog::<i64>::try_from(&malformed).unwrap_err();
+        let malformed = vec![0; APPROX_DISTINCT_HLL_STATE_SIZE as usize - 1];
+        let error = HyperLogLog::<i64>::try_from(malformed.as_slice()).unwrap_err();
         let malformed_length = APPROX_DISTINCT_HLL_STATE_SIZE - 1;
         assert!(error.to_string().contains(&format!(
             "has length {malformed_length}, expected {APPROX_DISTINCT_HLL_STATE_SIZE}"

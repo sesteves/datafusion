@@ -1104,8 +1104,6 @@ impl GroupedHashAggregateStream {
         match self.oom_mode {
             OutOfMemoryMode::Spill if !self.group_values.is_empty() => {
                 self.spill()?;
-                self.clear_shrink(self.batch_size);
-                self.update_memory_reservation()?;
                 Ok(None)
             }
             OutOfMemoryMode::EmitEarly if self.group_values.len() > 1 => {
@@ -1437,7 +1435,7 @@ impl GroupedHashAggregateStream {
                 }
                 None => {
                     return internal_err!(
-                        "Calling spill with no intermediate batch to spill"
+                        "Spill iterator produced no output for non-empty emitted batch"
                     );
                 }
             }
@@ -1572,6 +1570,8 @@ impl GroupedHashAggregateStream {
             return Ok(None);
         }
 
+        // An empty hash table can transition directly to passthrough because there is
+        // no accumulated state to drain before converting subsequent input batches.
         Ok(Some(self.emit_next(false)?.map_or(
             ExecutionState::SkippingAggregation,
             ExecutionState::ProducingOutput,
