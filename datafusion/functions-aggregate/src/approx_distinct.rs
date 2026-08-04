@@ -49,7 +49,8 @@ use std::fmt::{Debug, Formatter};
 use std::hash::{BuildHasher, Hash};
 use std::marker::PhantomData;
 
-const HLL_STATE_SIZE: i32 = 16384;
+/// Number of registers in the dense HyperLogLog intermediate state.
+pub const APPROX_DISTINCT_HLL_STATE_SIZE: i32 = 16384;
 
 make_udaf_expr_and_func!(
     ApproxDistinct,
@@ -62,16 +63,16 @@ make_udaf_expr_and_func!(
 impl<T: Hash + ?Sized> From<&HyperLogLog<T>> for ScalarValue {
     fn from(v: &HyperLogLog<T>) -> ScalarValue {
         let values = v.as_ref().to_vec();
-        ScalarValue::FixedSizeBinary(HLL_STATE_SIZE, Some(values))
+        ScalarValue::FixedSizeBinary(APPROX_DISTINCT_HLL_STATE_SIZE, Some(values))
     }
 }
 
 impl<T: Hash + ?Sized> TryFrom<&[u8]> for HyperLogLog<T> {
     type Error = DataFusionError;
     fn try_from(v: &[u8]) -> Result<HyperLogLog<T>> {
-        let arr: [u8; HLL_STATE_SIZE as usize] = v.try_into().map_err(|_| {
+        let arr: [u8; APPROX_DISTINCT_HLL_STATE_SIZE as usize] = v.try_into().map_err(|_| {
             internal_datafusion_err!(
-                "approx_distinct HLL state has length {}, expected {HLL_STATE_SIZE}",
+                "approx_distinct HLL state has length {}, expected {APPROX_DISTINCT_HLL_STATE_SIZE}",
                 v.len()
             )
         })?;
@@ -84,15 +85,15 @@ impl<T: Hash + ?Sized> TryFrom<&ScalarValue> for HyperLogLog<T> {
     fn try_from(v: &ScalarValue) -> Result<HyperLogLog<T>> {
         match v {
             ScalarValue::FixedSizeBinary(width, Some(value))
-                if *width == HLL_STATE_SIZE =>
+                if *width == APPROX_DISTINCT_HLL_STATE_SIZE =>
             {
                 value.as_slice().try_into()
             }
             ScalarValue::FixedSizeBinary(width, _) => internal_err!(
-                "approx_distinct HLL state has width {width}, expected {HLL_STATE_SIZE}"
+                "approx_distinct HLL state has width {width}, expected {APPROX_DISTINCT_HLL_STATE_SIZE}"
             ),
             _ => internal_err!(
-                "approx_distinct HLL state must be FixedSizeBinary({HLL_STATE_SIZE})"
+                "approx_distinct HLL state must be FixedSizeBinary({APPROX_DISTINCT_HLL_STATE_SIZE})"
             ),
         }
     }
@@ -218,13 +219,13 @@ macro_rules! default_accumulator_impl {
                 .downcast_ref::<FixedSizeBinaryArray>()
                 .ok_or_else(|| {
                     internal_datafusion_err!(
-                        "approx_distinct HLL state must be FixedSizeBinary({HLL_STATE_SIZE}), got {}",
+                        "approx_distinct HLL state must be FixedSizeBinary({APPROX_DISTINCT_HLL_STATE_SIZE}), got {}",
                         states[0].data_type()
                     )
                 })?;
-            if binary_array.value_length() != HLL_STATE_SIZE {
+            if binary_array.value_length() != APPROX_DISTINCT_HLL_STATE_SIZE {
                 return internal_err!(
-                    "approx_distinct HLL state has width {}, expected {HLL_STATE_SIZE}",
+                    "approx_distinct HLL state has width {}, expected {APPROX_DISTINCT_HLL_STATE_SIZE}",
                     binary_array.value_length()
                 );
             }
@@ -441,7 +442,7 @@ impl AggregateUDFImpl for ApproxDistinct {
             _ => Ok(vec![
                 Field::new(
                     format_state_name(args.name, "hll_registers"),
-                    DataType::FixedSizeBinary(HLL_STATE_SIZE),
+                    DataType::FixedSizeBinary(APPROX_DISTINCT_HLL_STATE_SIZE),
                     false,
                 )
                 .into(),
@@ -542,7 +543,7 @@ mod tests {
         let fields = state_fields(DataType::Int64);
         assert_eq!(
             fields[0].data_type(),
-            &DataType::FixedSizeBinary(HLL_STATE_SIZE)
+            &DataType::FixedSizeBinary(APPROX_DISTINCT_HLL_STATE_SIZE)
         );
         assert!(!fields[0].is_nullable());
 
@@ -559,8 +560,8 @@ mod tests {
         let state = source.state().unwrap();
         assert!(matches!(
             &state[0],
-            ScalarValue::FixedSizeBinary(HLL_STATE_SIZE, Some(value))
-                if value.len() == HLL_STATE_SIZE as usize
+            ScalarValue::FixedSizeBinary(APPROX_DISTINCT_HLL_STATE_SIZE, Some(value))
+                if value.len() == APPROX_DISTINCT_HLL_STATE_SIZE as usize
         ));
 
         let state_array = ScalarValue::iter_to_array(state).unwrap();
@@ -572,27 +573,28 @@ mod tests {
     #[test]
     fn malformed_hll_state_is_rejected() {
         let malformed = ScalarValue::FixedSizeBinary(
-            HLL_STATE_SIZE,
-            Some(vec![0; HLL_STATE_SIZE as usize - 1]),
+            APPROX_DISTINCT_HLL_STATE_SIZE,
+            Some(vec![0; APPROX_DISTINCT_HLL_STATE_SIZE as usize - 1]),
         );
         let error = HyperLogLog::<i64>::try_from(&malformed).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("has length 16383, expected 16384")
-        );
+        let malformed_length = APPROX_DISTINCT_HLL_STATE_SIZE - 1;
+        assert!(error.to_string().contains(&format!(
+            "has length {malformed_length}, expected {APPROX_DISTINCT_HLL_STATE_SIZE}"
+        )));
 
         let wrong_width = ScalarValue::FixedSizeBinary(8, Some(vec![0; 8]));
         let error = HyperLogLog::<i64>::try_from(&wrong_width).unwrap_err();
-        assert!(error.to_string().contains("has width 8, expected 16384"));
+        let wrong_width_message =
+            format!("has width 8, expected {APPROX_DISTINCT_HLL_STATE_SIZE}");
+        assert!(error.to_string().contains(&wrong_width_message));
 
         let wrong_width_array = ScalarValue::iter_to_array(vec![wrong_width]).unwrap();
         let mut acc = NumericHLLAccumulator::<Int64Type>::new();
         let error = acc.merge_batch(&[wrong_width_array]).unwrap_err();
-        assert!(error.to_string().contains("has width 8, expected 16384"));
+        assert!(error.to_string().contains(&wrong_width_message));
 
         let null_state = ScalarValue::iter_to_array(vec![ScalarValue::FixedSizeBinary(
-            HLL_STATE_SIZE,
+            APPROX_DISTINCT_HLL_STATE_SIZE,
             None,
         )])
         .unwrap();

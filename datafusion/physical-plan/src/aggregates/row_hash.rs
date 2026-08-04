@@ -244,7 +244,37 @@ fn bounded_emit_group_count(
 
     let estimated_bytes_per_group = estimated_state_bytes.div_ceil(num_groups).max(1);
     let groups_by_bytes = (EMIT_STATE_TARGET_BYTES / estimated_bytes_per_group).max(1);
+    // SessionConfig rejects zero through with_batch_size, but direct option
+    // mutation can still supply it. Always make progress in that case.
     num_groups.min(batch_size.max(1)).min(groups_by_bytes)
+}
+
+fn bounded_emit_to(
+    num_groups: usize,
+    batch_size: usize,
+    estimated_state_bytes: usize,
+) -> EmitTo {
+    let emit_count =
+        bounded_emit_group_count(num_groups, batch_size, estimated_state_bytes);
+    if emit_count == num_groups {
+        EmitTo::All
+    } else {
+        EmitTo::First(emit_count)
+    }
+}
+
+fn spill_run_reservation_size(
+    live_state_size: usize,
+    sort_memory: usize,
+    num_rows: usize,
+) -> usize {
+    // IncrementalSortIterator allocates one UInt32 row index when
+    // lexsort_to_indices runs. Account for that known buffer separately without
+    // weakening the existing conservative emitted-batch and sort-buffer estimate.
+    let sort_indices_memory = num_rows.saturating_mul(size_of::<u32>());
+    live_state_size
+        .saturating_add(sort_memory)
+        .saturating_add(sort_indices_memory)
 }
 
 /// HashTable based Grouping Aggregator
@@ -876,6 +906,9 @@ impl Stream for GroupedHashAggregateStream {
                 }
 
                 ExecutionState::ProducingOutput(batch) => {
+                    // RecordBatch clones only increment Arc references to immutable Arrow
+                    // buffers. Extracting this variant by value would make the state
+                    // transition substantially more complex for a cheap operation.
                     let batch = batch.clone();
                     // slice off a part of the batch, if needed
                     let output_batch;
@@ -1097,29 +1130,21 @@ impl GroupedHashAggregateStream {
         }
     }
 
-    fn update_memory_reservation(&mut self) -> Result<()> {
-        let acc = self.accumulators.iter().map(|x| x.size()).sum::<usize>();
-        let groups_and_acc_size = acc
-            + self.group_values.size()
-            + self.group_ordering.size()
-            + self.current_group_indices.allocated_size();
+    fn accumulator_and_group_state_size(&self) -> usize {
+        self.accumulators
+            .iter()
+            .fold(self.group_values.size(), |size, accumulator| {
+                size.saturating_add(accumulator.size())
+            })
+    }
 
-        // Reserve extra headroom for sorting during potential spill.
-        // When OOM triggers, group_aggregate_batch has already processed the
-        // latest input batch, so the internal state may have grown well beyond
-        // the last successful reservation. The emit batch reflects this larger
-        // actual state, and the sort needs memory proportional to it.
-        // By reserving headroom equal to the data size, we trigger OOM earlier
-        // (before too much data accumulates), ensuring the freed reservation
-        // after clear_shrink is sufficient to cover the sort memory.
-        let sort_headroom =
-            if self.oom_mode == OutOfMemoryMode::Spill && !self.group_values.is_empty() {
-                acc + self.group_values.size()
-            } else {
-                0
-            };
+    fn live_state_size(&self, accumulator_and_group_state_size: usize) -> usize {
+        accumulator_and_group_state_size
+            .saturating_add(self.group_ordering.size())
+            .saturating_add(self.current_group_indices.allocated_size())
+    }
 
-        let new_size = groups_and_acc_size + sort_headroom;
+    fn try_resize_reservation(&mut self, new_size: usize) -> Result<()> {
         let reservation_result = self.reservation.try_resize(new_size);
 
         if reservation_result.is_ok() {
@@ -1129,6 +1154,46 @@ impl GroupedHashAggregateStream {
         }
 
         reservation_result
+    }
+
+    fn release_completed_spill_run_reservation(&mut self, live_state_size: usize) {
+        if self.reservation.size() > live_state_size {
+            // Resizing downward is infallible for the built-in pools. Ignore an
+            // unexpected error here so a spill write failure remains the root error.
+            let _ = self.try_resize_reservation(live_state_size);
+        }
+    }
+
+    fn update_memory_reservation(&mut self) -> Result<()> {
+        let accumulator_and_group_state_size = self.accumulator_and_group_state_size();
+        let live_state_size = self.live_state_size(accumulator_and_group_state_size);
+        self.update_memory_reservation_for_sizes(
+            accumulator_and_group_state_size,
+            live_state_size,
+        )
+    }
+
+    fn update_memory_reservation_for_sizes(
+        &mut self,
+        accumulator_and_group_state_size: usize,
+        live_state_size: usize,
+    ) -> Result<()> {
+        // Reserve extra headroom for sorting during potential spill.
+        // When OOM triggers, group_aggregate_batch has already processed the
+        // latest input batch, so the internal state may have grown well beyond
+        // the last successful reservation. The emit batch reflects this larger
+        // actual state, and the sort needs memory proportional to it.
+        // By reserving headroom equal to the data size, we trigger OOM earlier
+        // (before too much data accumulates), ensuring the freed reservation
+        // after emitted state is removed is sufficient to cover sort memory.
+        let sort_headroom =
+            if self.oom_mode == OutOfMemoryMode::Spill && !self.group_values.is_empty() {
+                accumulator_and_group_state_size
+            } else {
+                0
+            };
+
+        self.try_resize_reservation(live_state_size.saturating_add(sort_headroom))
     }
 
     /// Create an output RecordBatch with the group keys and
@@ -1147,8 +1212,8 @@ impl GroupedHashAggregateStream {
         let mut output = self.group_values.emit(emit_to)?;
         // Early output keeps using the current ordering state, so its group indexes
         // must be shifted. Terminal output follows input_done(), whose Complete state
-        // has no indexes to shift. Spill preserves the previous EmitTo::All behavior;
-        // all groups are drained before ordering is reset or reused.
+        // has no indexes to shift. Spill drains all bounded chunks before ordering is
+        // reset or reused, so its intermediate group indexes need not be shifted.
         if let EmitTo::First(n) = emit_to
             && !spilling
             && !self.input_done
@@ -1168,9 +1233,12 @@ impl GroupedHashAggregateStream {
         }
         drop(timer);
 
-        // emit reduces the memory usage. Ignore Err from update_memory_reservation. Even if it is
-        // over the target memory size after emission, we can emit again rather than returning Err.
-        let _ = self.update_memory_reservation();
+        // Spill retains its existing reservation until spill() accounts for the emitted
+        // batch and sort workspace together. Other emission reduces memory usage, so an
+        // update failure can be ignored and another batch can be emitted.
+        if !spilling {
+            let _ = self.update_memory_reservation();
+        }
         let batch = RecordBatch::try_new(schema, output)?;
         debug_assert!(batch.num_rows() > 0);
 
@@ -1180,15 +1248,9 @@ impl GroupedHashAggregateStream {
     /// Emit at most one output batch from the remaining groups.
     fn emit_next(&mut self, spilling: bool) -> Result<Option<RecordBatch>> {
         let num_groups = self.group_values.len();
-        let estimated_state_bytes = self
-            .accumulators
-            .iter()
-            .fold(self.group_values.size(), |size, accumulator| {
-                size.saturating_add(accumulator.size())
-            });
-        let num_groups =
-            bounded_emit_group_count(num_groups, self.batch_size, estimated_state_bytes);
-        self.emit(EmitTo::First(num_groups), spilling)
+        let estimated_state_bytes = self.accumulator_and_group_state_size();
+        let emit_to = bounded_emit_to(num_groups, self.batch_size, estimated_state_bytes);
+        self.emit(emit_to, spilling)
     }
 
     /// Registers groups for empty grouping sets when no input rows were seen.
@@ -1293,11 +1355,12 @@ impl GroupedHashAggregateStream {
     /// This process helps in reducing memory pressure by allowing the data to be
     /// read back with streaming merge.
     fn spill(&mut self) -> Result<()> {
+        // Group indices are only used while aggregating input. Release them before
+        // materializing spill runs so the final iteration needs no special cleanup.
+        self.current_group_indices.clear();
+        self.current_group_indices.shrink_to(0);
+
         while let Some(emit) = self.emit_next(true)? {
-            if self.group_values.is_empty() {
-                self.clear_shrink(0);
-                self.update_memory_reservation()?;
-            }
             let batch_size_ratio = self.batch_size as f32 / emit.num_rows() as f32;
             let batch_memory = get_record_batch_memory_size(&emit);
             // The maximum worst case for a sort is 2X the original underlying buffers(regardless of slicing)
@@ -1309,12 +1372,20 @@ impl GroupedHashAggregateStream {
                 + (emit.get_sliced_size()? as f32 * batch_size_ratio) as usize)
                 .min(batch_memory * 2);
 
-            // If we can't grow even that, we have no choice but to return an error since we can't spill to disk without sorting the data first.
-            self.reservation.try_grow(sort_memory).map_err(|err| {
-                resources_datafusion_err!(
-                    "Failed to reserve memory for sort during spill: {err}"
-                )
-            })?;
+            // The sort_memory estimate includes both the emitted batch and the sort workspace.
+            // Replace the future-spill headroom with this run's concrete requirement
+            // rather than adding both reservations together.
+            let accumulator_and_group_state_size =
+                self.accumulator_and_group_state_size();
+            let live_state_size = self.live_state_size(accumulator_and_group_state_size);
+            let spill_run_memory =
+                spill_run_reservation_size(live_state_size, sort_memory, emit.num_rows());
+            self.try_resize_reservation(spill_run_memory)
+                .map_err(|err| {
+                    resources_datafusion_err!(
+                        "Failed to reserve memory for sort during spill: {err}"
+                    )
+                })?;
 
             let sorted_iter = IncrementalSortIterator::new(
                 emit,
@@ -1329,10 +1400,35 @@ impl GroupedHashAggregateStream {
                     "HashAggSpill",
                 );
 
-            // Shrink the memory we allocated for sorting as the sorting is fully done at this point.
-            self.reservation.shrink(sort_memory);
+            let spillfile = match spillfile {
+                Ok(spillfile) => spillfile,
+                Err(error) => {
+                    // The iterator and emitted batch have been dropped. Release their
+                    // obsolete workspace without growing from an under-reserved state,
+                    // and preserve the spill writer's error as the root cause.
+                    self.release_completed_spill_run_reservation(live_state_size);
+                    return Err(error);
+                }
+            };
 
-            match spillfile? {
+            // The iterator owns and consumes the emitted batch. Once it returns, restore
+            // the reservation for remaining live state and its next spill run headroom.
+            let reservation_result = self.update_memory_reservation_for_sizes(
+                accumulator_and_group_state_size,
+                live_state_size,
+            );
+            match reservation_result {
+                Ok(()) => {}
+                // The current reservation still contains live state plus the completed
+                // run's sort workspace. Retain that workspace as bounded headroom for
+                // materializing the next run when the larger future-headroom target is
+                // unavailable. The next iteration replaces it with its exact requirement.
+                Err(DataFusionError::ResourcesExhausted(_))
+                    if !self.group_values.is_empty() => {}
+                Err(error) => return Err(error),
+            }
+
+            match spillfile {
                 Some((spillfile, max_record_batch_memory)) => {
                     self.spill_state.spills.push(SortedSpillFile {
                         file: spillfile,
@@ -1529,11 +1625,14 @@ mod tests {
     use crate::execution_plan::ExecutionPlan;
     use crate::test::TestMemoryExec;
     use arrow::array::{Int32Array, Int64Array};
-    use arrow::datatypes::{DataType, Field, Int32Type, Int64Type, Schema};
+    use arrow::datatypes::{DataType, Field, Int32Type, Int64Type, Schema, UInt64Type};
     use datafusion_execution::config::SessionConfig;
     use datafusion_execution::disk_manager::DiskManagerBuilder;
+    use datafusion_execution::memory_pool::{FairSpillPool, MemoryConsumer, MemoryPool};
     use datafusion_execution::runtime_env::RuntimeEnvBuilder;
-    use datafusion_functions_aggregate::approx_distinct::approx_distinct_udaf;
+    use datafusion_functions_aggregate::approx_distinct::{
+        APPROX_DISTINCT_HLL_STATE_SIZE, approx_distinct_udaf,
+    };
     use datafusion_functions_aggregate::count::count_udaf;
     use datafusion_physical_expr::aggregate::AggregateExprBuilder;
     use datafusion_physical_expr::expressions::col;
@@ -1610,7 +1709,7 @@ mod tests {
     #[tokio::test]
     async fn hll_state_materialization_is_bounded() -> Result<()> {
         let batch_size = 8192;
-        let num_groups = 257;
+        let num_groups: i32 = 257;
         let schema = Arc::new(Schema::new(vec![
             Field::new("group_col", DataType::Int32, false),
             Field::new("value_col", DataType::Int64, false),
@@ -1618,7 +1717,7 @@ mod tests {
         let input = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![
-                Arc::new(Int32Array::from_iter_values(0..num_groups as i32)),
+                Arc::new(Int32Array::from_iter_values(0..num_groups)),
                 Arc::new(Int64Array::from_iter_values(10..10 + num_groups as i64)),
             ],
         )?;
@@ -1667,18 +1766,24 @@ mod tests {
             let batch = batch?;
             num_batches += 1;
             assert!(batch.num_rows() < batch_size);
-            assert!(batch.num_rows() <= EMIT_STATE_TARGET_BYTES / (2 * 16384));
+            assert!(
+                batch.num_rows()
+                    <= EMIT_STATE_TARGET_BYTES
+                        / (2 * APPROX_DISTINCT_HLL_STATE_SIZE as usize)
+            );
             for column in [1, 2] {
                 assert_eq!(
                     batch.column(column).data_type(),
-                    &DataType::FixedSizeBinary(16384)
+                    &DataType::FixedSizeBinary(APPROX_DISTINCT_HLL_STATE_SIZE)
                 );
                 let states = batch
                     .column(column)
                     .as_any()
                     .downcast_ref::<FixedSizeBinaryArray>()
                     .unwrap();
-                assert!(states.iter().flatten().all(|state| state.len() == 16384));
+                assert!(states.iter().flatten().all(|state| {
+                    state.len() == APPROX_DISTINCT_HLL_STATE_SIZE as usize
+                }));
             }
             groups.extend(
                 batch
@@ -1692,14 +1797,14 @@ mod tests {
 
         groups.sort_unstable();
         assert!(num_batches > 1);
-        assert_eq!(groups, (0..num_groups as i32).collect::<Vec<_>>());
+        assert_eq!(groups, (0..num_groups).collect::<Vec<_>>());
         Ok(())
     }
 
     #[test]
     fn emit_group_count_accounts_for_all_state_bytes() {
         let num_groups: usize = 8192;
-        let hll_state_bytes: usize = 16384;
+        let hll_state_bytes = APPROX_DISTINCT_HLL_STATE_SIZE as usize;
         let single_hll_bytes = num_groups * hll_state_bytes;
         let two_hll_bytes = single_hll_bytes.saturating_mul(2);
 
@@ -1718,6 +1823,34 @@ mod tests {
         assert_eq!(
             bounded_emit_group_count(1, num_groups, EMIT_STATE_TARGET_BYTES + 1),
             1
+        );
+        assert_eq!(bounded_emit_group_count(num_groups, 0, num_groups), 1);
+    }
+
+    #[test]
+    fn bounded_emit_uses_full_drain_only_when_all_groups_fit() {
+        assert_eq!(bounded_emit_to(2, 2, 2), EmitTo::All);
+        assert_eq!(bounded_emit_to(2, 1, 2), EmitTo::First(1));
+        assert_eq!(
+            bounded_emit_to(2, 2, 2 * EMIT_STATE_TARGET_BYTES),
+            EmitTo::First(1)
+        );
+        assert_eq!(bounded_emit_to(1, 0, 1), EmitTo::All);
+    }
+
+    #[test]
+    fn spill_run_reservation_accounts_for_sort_indices() {
+        let live_state_size = 100;
+        let sort_memory = 200;
+        let num_rows = 10;
+
+        assert_eq!(
+            spill_run_reservation_size(live_state_size, sort_memory, num_rows),
+            live_state_size + sort_memory + num_rows * size_of::<u32>()
+        );
+        assert_eq!(
+            spill_run_reservation_size(usize::MAX, usize::MAX, usize::MAX),
+            usize::MAX
         );
     }
 
@@ -1753,6 +1886,109 @@ mod tests {
         }
         spilled_groups.sort_unstable();
         assert_eq!(spilled_groups, (0..num_groups as i32).collect::<Vec<_>>());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounded_hll_spill_reuses_reserved_headroom() -> Result<()> {
+        let first_num_groups: i32 = 880;
+        let num_groups: i32 = 1600;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("group_col", DataType::Int32, false),
+            Field::new("value_col", DataType::Int64, false),
+        ]));
+        let first_input = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from_iter_values(0..first_num_groups)),
+                Arc::new(Int64Array::from_iter_values(0..first_num_groups as i64)),
+            ],
+        )?;
+        let second_input = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from_iter_values(first_num_groups..num_groups)),
+                Arc::new(Int64Array::from_iter_values(
+                    first_num_groups as i64..num_groups as i64,
+                )),
+            ],
+        )?;
+        let exec = TestMemoryExec::try_new(
+            &[vec![first_input.clone(), second_input.clone()]],
+            Arc::clone(&schema),
+            None,
+        )?;
+        let exec = Arc::new(TestMemoryExec::update_cache(&Arc::new(exec)));
+        let aggregate = AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::new_single(vec![(
+                col("group_col", &schema)?,
+                "group_col".to_string(),
+            )]),
+            vec![Arc::new(
+                AggregateExprBuilder::new(
+                    approx_distinct_udaf(),
+                    vec![col("value_col", &schema)?],
+                )
+                .schema(Arc::clone(&schema))
+                .alias("approx_distinct_value")
+                .build()?,
+            )],
+            vec![None],
+            exec,
+            schema,
+        )?;
+        let memory_pool: Arc<dyn MemoryPool> =
+            Arc::new(FairSpillPool::new(125 * 1024 * 1024));
+        let competing_consumers = (0..3)
+            .map(|index| {
+                MemoryConsumer::new(format!("competing_spill_consumer_{index}"))
+                    .with_can_spill(true)
+                    .register(&memory_pool)
+            })
+            .collect::<Vec<_>>();
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::clone(&memory_pool))
+            .with_disk_manager_builder(DiskManagerBuilder::default())
+            .build_arc()?;
+        let context = Arc::new(
+            TaskContext::default()
+                .with_session_config(SessionConfig::new().with_batch_size(8192))
+                .with_runtime(runtime),
+        );
+        let mut stream = GroupedHashAggregateStream::new(&aggregate, &context, 0)?;
+        stream.group_aggregate_batch(&first_input)?;
+        assert!(stream.try_update_memory_reservation()?.is_none());
+        assert!(stream.spill_state.spills.is_empty());
+        let reservation_before_spill = stream.reservation.size();
+        let state_size = stream.accumulator_and_group_state_size();
+        assert!(reservation_before_spill > stream.live_state_size(state_size));
+        stream.group_aggregate_batch(&second_input)?;
+        assert!(stream.try_update_memory_reservation()?.is_none());
+        assert!(stream.group_values.is_empty());
+        assert!(stream.spill_state.spills.len() > 1);
+        let state_size = stream.accumulator_and_group_state_size();
+        assert!(stream.reservation.size() >= stream.live_state_size(state_size));
+        assert!(stream.reservation.size() < reservation_before_spill);
+
+        // Restore the aggregate's full pool share before exercising external merge.
+        drop(competing_consumers);
+        stream.set_input_done_and_produce_output()?;
+        let mut groups = vec![];
+
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            let group_col = batch.column(0).as_primitive::<Int32Type>();
+            let counts = batch.column(1).as_primitive::<UInt64Type>();
+            for row in 0..batch.num_rows() {
+                assert_eq!(counts.value(row), 1);
+                groups.push(group_col.value(row));
+            }
+        }
+
+        groups.sort_unstable();
+        assert_eq!(groups, (0..num_groups).collect::<Vec<_>>());
+        assert!(aggregate.metrics().unwrap().spill_count().unwrap() > 0);
         Ok(())
     }
 
@@ -1844,6 +2080,73 @@ mod tests {
                 (101, 1),
             ]
         );
+        assert_eq!(
+            aggregate
+                .metrics()
+                .unwrap()
+                .sum_by_name("skipped_aggregation_rows")
+                .unwrap()
+                .as_usize(),
+            3
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn empty_group_skip_transitions_directly_to_passthrough() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("group_col", DataType::Int32, false),
+            Field::new("value_col", DataType::Int64, false),
+        ]));
+        let input = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![10, 10, 11])),
+                Arc::new(Int64Array::from(vec![1, 1, 1])),
+            ],
+        )?;
+        let exec = TestMemoryExec::try_new(&[vec![input]], Arc::clone(&schema), None)?;
+        let exec = Arc::new(TestMemoryExec::update_cache(&Arc::new(exec)));
+        let aggregate = AggregateExec::try_new(
+            AggregateMode::Partial,
+            PhysicalGroupBy::new_single(vec![(
+                col("group_col", &schema)?,
+                "group_col".to_string(),
+            )]),
+            vec![Arc::new(
+                AggregateExprBuilder::new(count_udaf(), vec![col("value_col", &schema)?])
+                    .schema(Arc::clone(&schema))
+                    .alias("count_value")
+                    .build()?,
+            )],
+            vec![None],
+            exec,
+            schema,
+        )?;
+        let context = Arc::new(TaskContext::default());
+        let mut stream = GroupedHashAggregateStream::new(&aggregate, &context, 0)?;
+        assert!(stream.group_values.is_empty());
+        let probe = stream.skip_aggregation_probe.as_mut().unwrap();
+        probe.should_skip = true;
+        probe.is_locked = true;
+
+        stream.exec_state = stream.switch_to_skip_aggregation()?.unwrap();
+        assert!(matches!(
+            stream.exec_state,
+            ExecutionState::SkippingAggregation
+        ));
+
+        let mut output = vec![];
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            let groups = batch.column(0).as_primitive::<Int32Type>();
+            let counts = batch.column(1).as_primitive::<Int64Type>();
+            for row in 0..batch.num_rows() {
+                output.push((groups.value(row), counts.value(row)));
+            }
+        }
+
+        assert_eq!(output, vec![(10, 1), (10, 1), (11, 1)]);
         assert_eq!(
             aggregate
                 .metrics()

@@ -2623,8 +2623,9 @@ mod tests {
         assert!(final_stats.total_byte_size.get_value().is_some());
 
         let task_ctx = if spill {
-            // enlarge memory limit to let the final aggregation finish
-            new_spill_ctx(2, 2600)
+            // Leave enough room for the final aggregate's full-drain output and
+            // active spill workspace alongside the partial aggregate stream.
+            new_spill_ctx(2, 9_000)
         } else {
             Arc::clone(&task_ctx)
         };
@@ -2654,9 +2655,9 @@ mod tests {
         let spilled_rows = metrics.spilled_rows().unwrap();
 
         if spill {
-            // When spilling, the output rows metrics become partial output size + final output size
-            // This is because final aggregation starts while partial aggregation is still emitting
-            assert_eq!(8, output_rows);
+            // The metric includes three merged intermediate rows emitted during
+            // final-stage spilling and the three final output rows.
+            assert_eq!(6, output_rows);
 
             assert!(spill_count > 0);
             assert!(spilled_bytes > 0);
@@ -3030,7 +3031,9 @@ mod tests {
     async fn run_first_last_multi_partitions() -> Result<()> {
         for is_first_acc in [false, true] {
             for spill in [false, true] {
-                first_last_multi_partitions(is_first_acc, spill, 4200).await?
+                // Four concurrent partitions need room for one full-drain spill
+                // run while the other streams retain their live reservations.
+                first_last_multi_partitions(is_first_acc, spill, 15_000).await?
             }
         }
         Ok(())
@@ -3958,8 +3961,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_aggregate_with_spill_if_necessary() -> Result<()> {
-        // test with spill
-        run_test_with_spill_pool_if_necessary(2_000, true).await?;
+        // The 5,000-byte pool covers remaining live group and aggregate state plus
+        // an active two-row spill run. The run reserves the emitted output and sort
+        // workspace at up to twice the output buffer size, plus exactly 8 bytes for
+        // two UInt32 sort indices. The former 2,000-byte pool cannot cover that sum.
+        run_test_with_spill_pool_if_necessary(5_000, true).await?;
         // test without spill
         run_test_with_spill_pool_if_necessary(20_000, false).await?;
         Ok(())
@@ -4683,7 +4689,9 @@ mod tests {
             Arc::clone(&schema),
         )?);
 
-        let task_ctx = new_spill_ctx(1, 600);
+        // The active one-row run needs 612 bytes: 600 for output and sorting,
+        // 4 for the UInt32 sort index, and 8 for remaining live state.
+        let task_ctx = new_spill_ctx(1, 700);
         let result = collect(aggr.execute(0, Arc::clone(&task_ctx))?).await?;
         assert_spill_count_metric(true, aggr);
 
