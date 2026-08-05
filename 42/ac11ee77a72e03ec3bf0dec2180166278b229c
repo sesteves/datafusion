@@ -1,0 +1,19 @@
+datafusion/functions-aggregate/src/approx_top_k.rs
+  s_4cd17e58640983::t_9739805b79d0cb 148
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "42ac11ee77a72e03ec3bf0dec2180166278b229c",
+  "prompts": {},
+  "sessions": {
+    "s_4cd17e58640983": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_31cea48d2ffeNd6ndO3y8OnkyH",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Sergio Esteves <sesteves@cloudflare.com>"
+    }
+  }
+}
